@@ -76,6 +76,13 @@ interface IEVM2EVMOffRampPreV1dot6Fork {
     ) external;
 }
 
+interface USDCTokenPool {
+    struct MessageAndAttestation {
+        bytes message;
+        bytes attestation;
+    }
+}
+
 /// @title CCIPLocalSimulatorFork
 /// @notice Works with Foundry only
 contract CCIPLocalSimulatorFork is Test {
@@ -194,6 +201,120 @@ contract CCIPLocalSimulatorFork is Test {
     }
 
     /**
+     * @notice Similar to switchChainAndRouteMessage but allows USDC transfer
+     * @param forkId The ID of the destination network fork
+     * @param attesters The attesters to be used
+     * @param attesterPks The private keys of the attesters
+     */
+    function switchChainAndRouteMessageWithUSDC(
+        uint256 forkId,
+        address[] memory attesters,
+        uint256[] memory attesterPks
+    ) external {
+        InternalPreV1dot6.EVM2EVMMessage memory message;
+        bytes memory cctpMessage;
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        uint256 length = entries.length;
+
+        for (uint256 i; i < length; ++i) {
+            if (entries[i].topics[0] == CCIPSendRequested.selector) {
+                message = abi.decode(entries[i].data, (InternalPreV1dot6.EVM2EVMMessage));
+                if (!s_processedMessages[message.messageId]) {
+                    s_processedMessages[message.messageId] = true;
+                }
+            }
+            if (entries[i].topics[0] == keccak256("MessageSent(bytes)")) {
+                cctpMessage = abi.decode(entries[i].data, (bytes));
+            }
+        }
+
+        require(cctpMessage.length > 0, "No CCTP message found");
+        bytes[] memory offchainTokenData = _createOffchainTokenData(cctpMessage, attesters, attesterPks);
+
+        vm.selectFork(forkId);
+        assertEq(vm.activeFork(), forkId);
+
+        IRouterFork.OffRamp[] memory offRamps =
+            IRouterFork(i_register.getNetworkDetails(block.chainid).routerAddress).getOffRamps();
+        length = offRamps.length;
+
+        for (uint256 i = length; i > 0; --i) {
+            if (offRamps[i - 1].sourceChainSelector == message.sourceChainSelector) {
+                vm.startPrank(offRamps[i - 1].offRamp);
+                uint256 numberOfTokens = message.tokenAmounts.length;
+                uint32[] memory tokenGasOverrides = new uint32[](numberOfTokens);
+                for (uint256 j; j < numberOfTokens; ++j) {
+                    tokenGasOverrides[j] = uint32(message.gasLimit);
+                }
+                IEVM2EVMOffRampPreV1dot6Fork(offRamps[i - 1].offRamp)
+                    .executeSingleMessage(message, offchainTokenData, tokenGasOverrides);
+                vm.stopPrank();
+                break;
+            }
+        }
+    }
+
+    /// @notice Creates the offchainTokenData array with the CCTP message
+    /// @param cctpMessage The CCTP message to create the offchainTokenData from
+    /// @param attesters The attesters to be used
+    /// @param attesterPks The private keys of the attesters
+    /// @return offchainTokenData The offchainTokenData array
+    function _createOffchainTokenData(
+        bytes memory cctpMessage,
+        address[] memory attesters,
+        uint256[] memory attesterPks
+    ) internal pure returns (bytes[] memory offchainTokenData) {
+        bytes32 messageHash = keccak256(cctpMessage);
+        bytes memory attestation;
+
+        // First, sort attesters and their private keys
+        for (uint256 i = 0; i < attesters.length; i++) {
+            for (uint256 j = i + 1; j < attesters.length; j++) {
+                if (attesters[i] > attesters[j]) {
+                    // Swap addresses
+                    address tempAddr = attesters[i];
+                    attesters[i] = attesters[j];
+                    attesters[j] = tempAddr;
+                    // Swap private keys
+                    uint256 tempKey = attesterPks[i];
+                    attesterPks[i] = attesterPks[j];
+                    attesterPks[j] = tempKey;
+                }
+            }
+        }
+
+        // Create attestations from all attesters in increasing order
+        for (uint256 i = 0; i < attesters.length; i++) {
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(attesterPks[i], messageHash);
+
+            // Ensure v is exactly 27 or 28 as required by CCTP's ECDSA
+            if (v < 27) {
+                v += 27;
+            }
+
+            // Create signature in the format expected by CCTP's ECDSA
+            bytes memory signature = new bytes(65);
+            assembly {
+                mstore(add(signature, 32), r)
+                mstore(add(signature, 64), s)
+                mstore8(add(signature, 96), v)
+            }
+
+            // Append the signature to the attestation
+            attestation = bytes.concat(attestation, signature);
+        }
+
+        // Create the message and attestation struct
+        USDCTokenPool.MessageAndAttestation memory msgAndAttestation =
+            USDCTokenPool.MessageAndAttestation({message: cctpMessage, attestation: attestation});
+
+        // Create offchainTokenData array with our message and attestation
+        offchainTokenData = new bytes[](1);
+        offchainTokenData[0] = abi.encode(msgAndAttestation);
+    }
+
+    /**
      * @notice Internal function to route captured messages to their respective destination forks.
      *
      * @param forkIds - The IDs of the destination network forks. These are the returned values of `createFork()` or `createSelectFork()`, not chainIds.
@@ -237,9 +358,8 @@ contract CCIPLocalSimulatorFork is Test {
                                     for (uint256 l; l < numberOfTokens; ++l) {
                                         tokenGasOverrides[l] = uint32(message.gasLimit);
                                     }
-                                    try IEVM2EVMOffRampPreV1dot6Fork(offRamps[k - 1].offRamp).executeSingleMessage(
-                                        message, offchainTokenData, tokenGasOverrides
-                                    ) {
+                                    try IEVM2EVMOffRampPreV1dot6Fork(offRamps[k - 1].offRamp)
+                                        .executeSingleMessage(message, offchainTokenData, tokenGasOverrides) {
                                         vm.stopPrank();
                                         s_processedMessages[message.messageId] = true;
                                     } catch (bytes memory err) {
@@ -286,7 +406,9 @@ contract CCIPLocalSimulatorFork is Test {
                                         new Internal.Any2EVMTokenTransfer[](numberOfTokens);
                                     for (uint256 l; l < numberOfTokens; ++l) {
                                         tokenAmounts[l] = Internal.Any2EVMTokenTransfer({
-                                            sourcePoolAddress: abi.encodePacked(message.tokenAmounts[l].sourcePoolAddress),
+                                            sourcePoolAddress: abi.encodePacked(
+                                                message.tokenAmounts[l].sourcePoolAddress
+                                            ),
                                             destTokenAddress: address(
                                                 uint160(bytes20(message.tokenAmounts[l].destTokenAddress))
                                             ),
@@ -308,9 +430,10 @@ contract CCIPLocalSimulatorFork is Test {
                                     for (uint256 l; l < numberOfTokens; ++l) {
                                         tokenGasOverrides[l] = uint32(gasLimit);
                                     }
-                                    try IEVM2EVMOffRampFork(offRamps[k - 1].offRamp).executeSingleMessage(
-                                        any2EVMRampMessage, offchainTokenData, tokenGasOverrides
-                                    ) {
+                                    try IEVM2EVMOffRampFork(offRamps[k - 1].offRamp)
+                                        .executeSingleMessage(
+                                            any2EVMRampMessage, offchainTokenData, tokenGasOverrides
+                                        ) {
                                         vm.stopPrank();
                                     } catch (bytes memory err) {
                                         vm.stopPrank();
